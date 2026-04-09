@@ -69,11 +69,9 @@ const severityConfig = {
   },
 };
 
-// Update this list as you add more videos to public/videos/
-const SAMPLE_VIDEOS = ["/videos/1.mp4", "/videos/2.mp4", "/videos/3.mp4"];
-
-function getVideoSrc(seed: number) {
-  return SAMPLE_VIDEOS[seed % SAMPLE_VIDEOS.length];
+function getVideoSrc(videos: string[], seed: number) {
+  if (!videos.length) return "";
+  return videos[seed % videos.length];
 }
 
 function getFakeVideo(seed: number) {
@@ -269,36 +267,51 @@ const eventTypeIcon: Record<string, string> = {
 
 function VideoDetailModal({ session, seed, onClose }: { session: VideoSession; seed: number; onClose: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const progressBarRef = useRef<HTMLDivElement>(null);
+  const timeDisplayRef = useRef<HTMLSpanElement>(null);
+  const rafRef = useRef<number>(0);
   const [playing, setPlaying] = useState(true);
   const [activeEvent, setActiveEvent] = useState<number | null>(null);
 
   const eventSet = timestampEventPool[seed % timestampEventPool.length];
   const playByPlay = aiPlayByPlay[seed % aiPlayByPlay.length];
 
+  // Pause every other video on the page while this modal is open
+  useEffect(() => {
+    const others = Array.from(document.querySelectorAll("video")).filter(v => v !== videoRef.current);
+    others.forEach(v => v.pause());
+    return () => others.forEach(v => v.play().catch(() => {}));
+  }, []);
+
+  // RAF loop: drives progress bar + time display via direct DOM writes — zero React re-renders during playback
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
     v.play().catch(() => {});
-    const onTime = () => setCurrentTime(v.currentTime);
-    const onMeta = () => setDuration(v.duration);
-    v.addEventListener("timeupdate", onTime);
-    v.addEventListener("loadedmetadata", onMeta);
-    return () => {
-      v.removeEventListener("timeupdate", onTime);
-      v.removeEventListener("loadedmetadata", onMeta);
-    };
-  }, []);
 
-  useEffect(() => {
-    if (!duration) return;
-    const pct = currentTime / duration;
-    const realT = pct * 45;
-    let last: number | null = null;
-    eventSet.forEach((e, i) => { if (e.t <= realT) last = i; });
-    setActiveEvent(last);
-  }, [currentTime, duration, eventSet]);
+    let lastActive: number | null = null;
+
+    const tick = () => {
+      const dur = v.duration;
+      if (dur && isFinite(dur)) {
+        const pct = (v.currentTime / dur) * 100;
+        if (progressBarRef.current) progressBarRef.current.style.width = `${pct}%`;
+        if (timeDisplayRef.current) {
+          const s = Math.floor(v.currentTime);
+          timeDisplayRef.current.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+        }
+        // Only setState when the active event card actually changes
+        const realT = (v.currentTime / dur) * 45;
+        let next: number | null = null;
+        eventSet.forEach((e, i) => { if (e.t <= realT) next = i; });
+        if (next !== lastActive) { lastActive = next; setActiveEvent(next); }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [eventSet]);
 
   const togglePlay = () => {
     const v = videoRef.current;
@@ -307,13 +320,22 @@ function VideoDetailModal({ session, seed, onClose }: { session: VideoSession; s
     else { v.pause(); setPlaying(false); }
   };
 
-  const seekToEvent = (t: number) => {
+  const fastSeekTo = (target: number) => {
     const v = videoRef.current;
-    if (!v || !duration) return;
-    v.currentTime = (t / 45) * duration;
+    if (!v) return;
+    // fastSeek jumps to the nearest keyframe instantly; fall back to currentTime
+    if (typeof (v as HTMLVideoElement & { fastSeek?: (t: number) => void }).fastSeek === "function") {
+      (v as HTMLVideoElement & { fastSeek: (t: number) => void }).fastSeek(target);
+    } else {
+      v.currentTime = target;
+    }
   };
 
-  const progressPct = duration ? (currentTime / duration) * 100 : 0;
+  const seekToEvent = (t: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    fastSeekTo((t / 45) * (v.duration || 0));
+  };
 
   return (
     <div className="fixed inset-0 z-50 bg-[#0a0a0a]/95 backdrop-blur-sm flex flex-col">
@@ -372,11 +394,10 @@ function VideoDetailModal({ session, seed, onClose }: { session: VideoSession; s
                 className="relative h-2 bg-white/10 rounded-full cursor-pointer"
                 onClick={(e) => {
                   const rect = e.currentTarget.getBoundingClientRect();
-                  const pct = (e.clientX - rect.left) / rect.width;
-                  if (videoRef.current) videoRef.current.currentTime = pct * (videoRef.current.duration || 0);
+                  fastSeekTo(((e.clientX - rect.left) / rect.width) * (videoRef.current?.duration || 0));
                 }}
               >
-                <div className="absolute top-0 left-0 h-full bg-violet-500 rounded-full" style={{ width: `${progressPct}%` }} />
+                <div ref={progressBarRef} className="absolute top-0 left-0 h-full bg-violet-500 rounded-full" style={{ width: "0%" }} />
                 {eventSet.map((ev, i) => (
                   <button
                     key={i}
@@ -388,9 +409,7 @@ function VideoDetailModal({ session, seed, onClose }: { session: VideoSession; s
                 ))}
               </div>
               <div className="flex justify-between mt-2">
-                <span className="text-[10px] text-white/25 font-mono">
-                  {Math.floor(currentTime / 60)}:{String(Math.floor(currentTime % 60)).padStart(2, "0")}
-                </span>
+                <span ref={timeDisplayRef} className="text-[10px] text-white/25 font-mono">0:00</span>
                 <span className="text-[10px] text-white/25 font-mono">{session.duration}</span>
               </div>
             </div>
@@ -591,6 +610,12 @@ function CreateTicketModal({ issue, onClose }: { issue: Issue; onClose: () => vo
 }
 
 export default function Home() {
+  const [videos, setVideos] = useState<string[]>([]);
+
+  useEffect(() => {
+    fetch("/api/videos").then((r) => r.json()).then(setVideos).catch(() => {});
+  }, []);
+
   const [activeTab, setActiveTab] = useState<"issues" | "search">("issues");
   const [selectedIssue, setSelectedIssue] = useState<number | null>(null);
   const [panelVisible, setPanelVisible] = useState(false);
@@ -724,7 +749,7 @@ export default function Home() {
             {filteredSessions.length > 0 ? (
               <div className="grid grid-cols-3 gap-4">
                 {filteredSessions.map((session) => {
-                  const src = SAMPLE_VIDEOS[session.videoIdx % SAMPLE_VIDEOS.length];
+                  const src = getVideoSrc(videos, session.videoIdx);
                   return (
                     <div key={session.id} className="group cursor-pointer">
                       <div
@@ -818,7 +843,7 @@ export default function Home() {
                 const isSelected = selectedIssue === issue.id && panelVisible;
 
                 return (
-                  <button
+                  <div
                     key={issue.id}
                     onClick={() => handleIssueClick(issue.id)}
                     className={`w-full text-left bg-white/[0.03] border rounded-xl px-5 py-4 transition-all duration-200 cursor-pointer
@@ -884,7 +909,7 @@ export default function Home() {
                         </button>
                       </div>
                     </div>
-                  </button>
+                  </div>
                 );
               })}
             </div>
@@ -903,8 +928,8 @@ export default function Home() {
             const panelSessions = Array.from({ length: 36 }, (_, i) => {
               const globalSeed = i + selected.id * 36;
               const v = getFakeVideo(globalSeed);
-              const src = getVideoSrc(globalSeed);
-              const seed = globalSeed % 3;
+              const src = getVideoSrc(videos, globalSeed);
+              const seed = globalSeed % Math.max(1, videos.length);
               const tagPool = [allTags[globalSeed % allTags.length], allTags[(globalSeed + 3) % allTags.length]];
               const title = sessionVideos[globalSeed % sessionVideos.length].title;
               return { i, v, src, seed, tagPool, title };
